@@ -17,6 +17,9 @@ from yaml.constructor import ConstructorError, SafeConstructor
 DELIMITER = '@'
 
 
+logger = logging.getLogger(__name__)
+
+
 class Constructor(SafeConstructor):
     r"""overload with OrderedDict fix"""
 
@@ -50,31 +53,44 @@ class Constructor(SafeConstructor):
         data.update(value)
 
 
-class Loader(
-        yaml.reader.Reader, yaml.scanner.Scanner, yaml.parser.Parser, yaml.composer.Composer,
-        Constructor,
-        yaml.resolver.Resolver):
-    r"""overload"""
-
-    def __init__(self, stream):
-        yaml.reader.Reader.__init__(self, stream)
-        yaml.scanner.Scanner.__init__(self)
-        yaml.parser.Parser.__init__(self)
-        yaml.composer.Composer.__init__(self)
-        Constructor.__init__(self)
-        yaml.resolver.Resolver.__init__(self)
-
-
-logger = logging.getLogger(__name__)
-
-logger.warning('there is bug in py2-cYAML binding, using pyYAML Loader and Dumper only')
-
 Constructor.add_constructor(
         u'tag:yaml.org,2002:map',
         Constructor.construct_yaml_map)
 
+if hasattr(yaml, 'cyaml'):
+    class Loader(
+            yaml.cyaml.CParser,
+            Constructor,
+            yaml.resolver.Resolver):
+        r"""overload"""
+
+        def __init__(self, stream):
+            yaml.cyaml.CParser.__init__(self, stream)
+            Constructor.__init__(self)
+            yaml.resolver.Resolver.__init__(self)
+
+    dumper = yaml.CSafeDumper
+else:
+    logger.warning('cYAML not enabled, using pyYAML implementation may impact performance')
+
+    class Loader(
+            yaml.reader.Reader, yaml.scanner.Scanner,
+            yaml.parser.Parser, yaml.composer.Composer,
+            Constructor,
+            yaml.resolver.Resolver):
+        r"""overload"""
+
+        def __init__(self, stream):
+            yaml.reader.Reader.__init__(self, stream)
+            yaml.scanner.Scanner.__init__(self)
+            yaml.parser.Parser.__init__(self)
+            yaml.composer.Composer.__init__(self)
+            Constructor.__init__(self)
+            yaml.resolver.Resolver.__init__(self)
+
+    dumper = yaml.SafeDumper
+
 loader = Loader
-dumper = yaml.SafeDumper
 
 
 def load_prototxt(
@@ -146,7 +162,7 @@ def dump_prototxt(
     direct serialize to ProtoBuffer text format
     quote_rule:
         function judges wether a non-quoted and non-numeric value string should be quoted
-        by default non-numeric, non-bool and non-uppercase
+        by default non-bool and non-uppercase
     quote: quote conversion, ' or "
     indent: indent size
     dump_kwargs: kwargs for 'yaml.dump'
