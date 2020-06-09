@@ -87,7 +87,7 @@ def load_prototxt(
 
 def dump_prototxt(
         o:'Any',
-        quote_rule:'Optional[Callable]'=None,
+        quote_rule:'Optional[Callable[str, bool]]'=None,
         quote:str='"', indent:int=2,
         **dump_kwargs)->str:
     r"""
@@ -116,10 +116,11 @@ def dump_prototxt(
         if re.match(r'nanf?', s, re.IGNORECASE):
             return True
         try:
-            float(s.rstrip('f'))
-            return True
+            float(s.rstrip('f')) # throw ValueError
         except ValueError:
             return False
+        else:
+            return True
 
     if quote_rule is None:
         quote_rule = lambda s: not (
