@@ -11,10 +11,11 @@ from __future__ import absolute_import, division, unicode_literals
 import logging, re
 import yaml
 
-from yaml.constructor import ConstructorError, SafeConstructor
+from yaml.constructor import SafeConstructor
 
 
-DELIMITER = '@'
+DELIMITER       = '@'
+UNAME_ID_FORMAT = '%09d'
 
 
 logger = logging.getLogger(__name__)
@@ -24,12 +25,13 @@ class Constructor(SafeConstructor):
     r"""overload with OrderedDict fix"""
 
     from collections import OrderedDict
+    from yaml.constructor import ConstructorError
 
     def construct_mapping(
             self, node,
             *args, **kwargs):
         if not isinstance(node, yaml.nodes.MappingNode):
-            raise ConstructorError(
+            raise self.ConstructorError(
                     None, None,
                     "expected a mapping node, but found %s" % (node.id, ),
                     node.start_mark)
@@ -38,8 +40,8 @@ class Constructor(SafeConstructor):
             key = self.construct_object(key_node, *args, **kwargs)
             try:
                 hash(key)
-            except TypeError, exc:
-                raise ConstructorError(
+            except TypeError as exc:
+                raise self.ConstructorError(
                         "while constructing a mapping", node.start_mark,
                         "found unacceptable key (%s)" % (exc, ), key_node.start_mark)
             value = self.construct_object(value_node, *args, **kwargs)
@@ -49,6 +51,7 @@ class Constructor(SafeConstructor):
     def construct_yaml_map(self, node):
         data = self.OrderedDict()
         yield data
+
         value = self.construct_mapping(node)
         data.update(value)
 
@@ -98,7 +101,7 @@ def load_prototxt(
         force_builtin_dict=False,
         **load_kwargs): # ->'Any':
     r"""
-    direct deserialize from ProtoBuffer text format
+    direct deserialize from Protobuf text format
     force_builtin_dict: restore built-in dict after OrderedDict fix
     load_kwargs: kwargs for 'yaml.load', leave it empty
     """
@@ -112,25 +115,25 @@ def load_prototxt(
     unames = dict()
 
     def replace_key(s):
-        t = ''
+        t = []
         start = 0
         idx = 0
         for m in re.finditer(r'(\n\s*)(\w+)\s*:', s):
             prefix, ok = m.groups()
-            nk = ok + DELIMITER + '%09d' % (idx, )
+            nk = ok + DELIMITER + UNAME_ID_FORMAT % (idx, )
             unames[nk] = ok
-            t += s[start:m.start()]
-            t += prefix + nk + ':'
+            t.extend([s[start:m.start()], prefix, nk, ':'])
             start = m.end()
             idx += 1
-        return t + s[start:]
+        t.append(s[start:])
+        return ''.join(t)
 
     def restore_key(no):
         oo = dict() if force_builtin_dict else type(no)()
         for nk, nv in no.items():
             ok = unames[nk]
             nv = restore_key(nv) if isinstance(nv, dict) else nv
-            ov = oo.get(ok, None)
+            ov = oo.get(ok)
             if ov is None:
                 oo[ok] = nv
             else:
@@ -155,46 +158,29 @@ def load_prototxt(
 
 def dump_prototxt(
         o,
-        quote_rule=None,
+        unquote_rule=None,
         quote='"', indent=2,
         **dump_kwargs): # ->str:
     r"""
-    direct serialize to ProtoBuffer text format
-    quote_rule:
-        function judges wether a non-quoted and non-numeric value string should be quoted
-        by default non-bool and non-uppercase
-    quote: quote conversion, ' or "
+    direct serialize to Protobuf text format
+    unquote_rule:
+        function judges wether a string value should not be quoted for types like enum,
+        by default full-uppercased
+    quote: prefered quote convension, ' or "
     indent: indent size
     dump_kwargs: kwargs for 'yaml.dump'
     """
 
     list_clss = (list, tuple, set)
+
+    assert not isinstance(o, list_clss), "'o' cannot be unnamed list"
+
     dump_kwargs_ = dict(
             indent=indent, width=(indent * 2 + 1),
             default_flow_style=True, allow_unicode=True,
             )
     dump_kwargs_.update(dump_kwargs)
     dump = lambda o: yaml.dump(o, Dumper=dumper, **dump_kwargs_)
-    is_quoted = lambda s: (
-            s.startswith('"') and s.endswith('"') or s.startswith("'") and s.endswith("'"))
-
-    def is_numeric(s):
-        if re.match(r'-?inf(?:inity)?f?', s, re.IGNORECASE):
-            return True
-        if re.match(r'nanf?', s, re.IGNORECASE):
-            return True
-        try:
-            float(s.rstrip('f'))
-            return True
-        except ValueError:
-            return False
-
-    if quote_rule is None:
-        quote_rule = lambda s: not (
-                s == 'true' or s == 'false' or s == 'True' or s == 'False' or
-                s.isupper()) # or s.istitle()) # HINT: enum convensions
-
-    assert not isinstance(o, list_clss), "'o' cannot be unnamed list"
 
     def remove_document_end(s):
         t = '\n...'
@@ -202,91 +188,107 @@ def dump_prototxt(
             s = s[:-len(t)]
         return s
 
-    if not isinstance(o, dict): # if scalar
-        s = dump(o)
-        s = s.strip()
-        s = remove_document_end(s)
-        if not is_quoted(s) and not is_numeric(s) and quote_rule(s):
-            s = quote + s + quote
+    if not isinstance(o, dict): # extra scalar support
+        if isinstance(o, basestring):
+            s = quote + o + quote
+        else:
+            s = dump(o)
+            s = s.strip()
+            s = remove_document_end(s)
         return s + '\n'
 
-    def replace_key(oo):
+    str_tag = '!str '
+    str_re = re.compile(r'([\'"])' + str_tag + r'(.*)([\'"])\s*\n')
+    unquote_rule = unquote_rule or (lambda s: s.isupper()) # basestring sucks
+
+    def replace_key_value(oo):
         no = type(oo)()
         for ok, ov in oo.items():
             if isinstance(ov, dict):
-                no[ok] = replace_key(ov)
+                no[ok] = replace_key_value(ov)
+            elif isinstance(ov, basestring):
+                no[ok] = str_tag + ov
             elif isinstance(ov, list_clss):
                 prefix = str(ok) + DELIMITER
                 for idx, oi in enumerate(ov):
                     assert not isinstance(oi, list_clss), 'list item cannot be unnamed list'
 
-                    nk = prefix + '%09d' % (idx, ) # make key ordered
-                    ni = replace_key(oi) if isinstance(oi, dict) else oi
+                    nk = prefix + UNAME_ID_FORMAT % (idx, ) # make key ordered
+                    ni = replace_key_value(oi) if isinstance(oi, dict) else oi
                     no[nk] = ni
             else:
                 no[ok] = ov
         return no
 
     def restore_key(s):
-        t = ''
+        t = []
         start = 0
         for m in re.finditer(r'(\n\s*)(\w+)' + DELIMITER + r'\d+\s*:', s):
             prefix, ok = m.groups()
-            t += s[start:m.start()]
-            t += prefix + ok + ':'
+            t.extend([s[start:m.start()], prefix, ok, ':'])
             start = m.end()
-        s = t + s[start:]
-        return s
+        t.append(s[start:])
+        return ''.join(t)
 
     def fix_mapping_end_break(s):
-        t = ''
+        t = []
         start = 0
         current_space_size = 0
         for m in re.finditer(r'\n(\s*)(.+?)({*)(}*)(?=\n)', s):
             spaces, content, lbraces, rbraces = m.groups()
 
-            t += s[start:m.start()]
+            t.append(s[start:m.start()])
 
             if len(spaces) > current_space_size:
                 assert len(spaces) == current_space_size + indent
 
                 spaces = spaces[:current_space_size]
-                t += ' ' + content
+                t.extend([' ', content])
             else:
                 assert len(spaces) == current_space_size
 
-                t += '\n' + spaces + content
+                t.extend(['\n', spaces, content])
 
-            for brace in lbraces:
-                t += brace
-                current_space_size += indent
-
+            t.append(lbraces)
+            current_space_size += indent * len(lbraces)
             assert current_space_size >= len(rbraces) * indent
 
             for brace in rbraces:
                 spaces = spaces[:-indent]
-                t += '\n' + spaces + brace
-                current_space_size -= indent
+                t.extend(['\n', spaces, brace])
+            current_space_size -= indent * len(rbraces)
 
             start = m.end()
-        return t + s[start:]
+        t.append(s[start:])
+        return ''.join(t)
 
     def fix_value_quote(s):
-        t = ''
+        t = []
         start = 0
         for m in re.finditer(r'(?<=\n)(\s*)(\w+)(:\s*)(.+?)(\s*\n)', s):
             s0, key, s1, value, s2 = m.groups()
 
-            if not is_quoted(value) and not is_numeric(value) and quote_rule(value):
-                value = quote + value + quote
+            values = [value]
+            str_match = str_re.match(value + s2)
+            if str_match:
+                lquote, value, rquote = str_match.groups()
+                if lquote == rquote:
+                    if unquote_rule(value):
+                        values = [value]
+                    else:
+                        if lquote != quote and quote not in value: # HINT: not forced
+                            lquote = quote
+                        values = [lquote, value, lquote]
 
-            t += s[start:m.start()]
-            t += s0 + key + s1 + value + s2
+            t.extend([s[start:m.start()], s0, key, s1])
+            t.extend(values)
+            t.append(s2)
 
             start = m.end()
-        return t + s[start:]
+        t.append(s[start:])
+        return ''.join(t)
 
-    o = replace_key(o)
+    o = replace_key_value(o)
     # HINT: ~ canonical=True
     s = dump(o)
     s = '\n' + s.strip()[1: -1].replace('\n  ', '\n') + '\n' # remove root flow mapping brace
@@ -296,14 +298,15 @@ def dump_prototxt(
     s = fix_value_quote(s)
     return s[1:]
 
+
 if __name__ == '__main__':
     o = 'hello world'
-    t = dump_prototxt(o, quote_rule=(lambda s: ' ' in s))
+    t = dump_prototxt(o)
     print(t)
     o = load_prototxt(t)
     print(o)
     print('-' * 8)
-    o = {'hello': [{'world': 42}, {'what': False}]}
+    o = {'hello': [{'world': 42}, {'what': False}, {'enum': 'DEBUG'}]}
     t = dump_prototxt(o)
     print(t)
     o = load_prototxt(t)
