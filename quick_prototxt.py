@@ -11,31 +11,32 @@ from __future__ import absolute_import, division, unicode_literals
 import logging, re
 import yaml
 
-from yaml.constructor import SafeConstructor
+from collections import OrderedDict
+from yaml.constructor import ConstructorError, SafeConstructor
 
 
 DELIMITER       = '@'
 UNAME_ID_FORMAT = '%09d'
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(name=__name__)
+
+default_dict_cls = OrderedDict
 
 
+# @inherit_docs
 class Constructor(SafeConstructor):
-    r"""overload with OrderedDict fix"""
-
-    from collections import OrderedDict
-    from yaml.constructor import ConstructorError
+    r"""overload with custom dict class"""
 
     def construct_mapping(
             self, node,
             *args, **kwargs):
         if not isinstance(node, yaml.nodes.MappingNode):
-            raise self.ConstructorError(
+            raise ConstructorError(
                     None, None,
                     "expected a mapping node, but found %s" % (node.id, ),
                     node.start_mark)
-        mapping = self.OrderedDict()
+        mapping = default_dict_cls()
         for key_node, value_node in node.value:
             key = self.construct_object(key_node, *args, **kwargs)
             try:
@@ -49,7 +50,7 @@ class Constructor(SafeConstructor):
         return mapping
 
     def construct_yaml_map(self, node):
-        data = self.OrderedDict()
+        data = default_dict_cls()
         yield data
 
         value = self.construct_mapping(node)
@@ -61,6 +62,7 @@ Constructor.add_constructor(
         Constructor.construct_yaml_map)
 
 if hasattr(yaml, 'cyaml'):
+    # @inherit_docs
     class Loader(
             yaml.cyaml.CParser,
             Constructor,
@@ -76,6 +78,7 @@ if hasattr(yaml, 'cyaml'):
 else:
     logger.warning('cYAML not enabled, using pyYAML implementation may impact performance')
 
+    # @inherit_docs
     class Loader(
             yaml.reader.Reader, yaml.scanner.Scanner,
             yaml.parser.Parser, yaml.composer.Composer,
@@ -312,6 +315,10 @@ if __name__ == '__main__':
     o = load_prototxt(t)
     print(o)
     print('-' * 8)
+
+    from easydict import EasyDict
+
+    default_dict_cls = EasyDict
     o = {'y': [1, 2], 'x': [{'a': 3.0, 'b': {'c': 4}}, {'a': 0, 'z': '1 2 3 4'}]}
     t = dump_prototxt(o)
     print(t)
