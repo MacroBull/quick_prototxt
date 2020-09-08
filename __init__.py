@@ -1,5 +1,5 @@
 
 from .quick_prototxt import (
         DELIMITER,
-        load_prototxt, dump_prototxt,
+        dump_prototxt, load_prototxt, set_default_dict_type,
         )

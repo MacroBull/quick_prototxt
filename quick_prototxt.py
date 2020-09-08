@@ -12,20 +12,101 @@ import logging, re
 import yaml
 
 
-DELIMITER       :str = '@'
-UNAME_ID_FORMAT :str = '{:09d}'
+DELIMITER             :str = '@'
+UNAME_ID_FORMAT       :str = '{:09d}'
+
+CYAML_WARNING_MESSAGE :str = (
+        'cYAML not enabled, using pyYAML implementation may impact performance')
 
 
-logger :logging.Logger = logging.getLogger(__name__)
+logger :logging.Logger = logging.getLogger(name=__name__)
+
+state :dict = dict()
 
 if hasattr(yaml, 'cyaml'):
-    loader :yaml.Loader = yaml.CSafeLoader
     dumper :yaml.Dumper = yaml.CSafeDumper
-else:
-    logger.warning('cYAML not enabled, using pyYAML implementation may impact performance')
 
-    loader :yaml.Loader = yaml.SafeLoader
+    state['loader'] = yaml.CSafeLoader
+else:
+    logger.warning(CYAML_WARNING_MESSAGE)
+
     dumper :yaml.Dumper = yaml.SafeDumper
+
+    state['loader'] = yaml.SafeLoader
+
+
+def set_default_dict_type(dict_cls:type):
+    r"""override default dict class"""
+
+    from collections.abc import Hashable
+    from yaml import Node
+    from yaml.constructor import ConstructorError, SafeConstructor
+
+    # @inherit_docs
+    class Constructor(SafeConstructor):
+        r"""overload with custom dict class"""
+
+        def construct_mapping(
+                self, node:Node,
+                *args, **kwargs)->'Mapping[Any, Any]':
+            if not isinstance(node, yaml.nodes.MappingNode):
+                raise ConstructorError(
+                        None, None,
+                        "expected a mapping node, but found %s" % (node.id, ),
+                        node.start_mark)
+            mapping = dict_cls()
+            for key_node, value_node in node.value:
+                key = self.construct_object(key_node, *args, **kwargs)
+                if not isinstance(key, Hashable):
+                    raise ConstructorError("while constructing a mapping", node.start_mark,
+                            "found unhashable key", key_node.start_mark)
+                value = self.construct_object(value_node, *args, **kwargs)
+                mapping[key] = value
+            return mapping
+
+        def construct_yaml_map(self, node:Node):
+            data = dict_cls()
+            yield data
+
+            value = self.construct_mapping(node)
+            data.update(value)
+
+    Constructor.add_constructor(
+            u'tag:yaml.org,2002:map',
+            Constructor.construct_yaml_map)
+
+    if hasattr(yaml, 'cyaml'):
+        # @inherit_docs
+        class Loader(
+                yaml.cyaml.CParser,
+                Constructor,
+                yaml.resolver.Resolver):
+            r"""overload"""
+
+            def __init__(self, stream:'io.TextIOBase'):
+                yaml.cyaml.CParser.__init__(self, stream)
+                Constructor.__init__(self)
+                yaml.resolver.Resolver.__init__(self)
+    else:
+        logger.warning(CYAML_WARNING_MESSAGE)
+
+        # @inherit_docs
+        class Loader(
+                yaml.reader.Reader, yaml.scanner.Scanner,
+                yaml.parser.Parser, yaml.composer.Composer,
+                Constructor,
+                yaml.resolver.Resolver):
+            r"""overload"""
+
+            def __init__(self, stream:'io.TextIOBase'):
+                yaml.reader.Reader.__init__(self, stream)
+                yaml.scanner.Scanner.__init__(self)
+                yaml.parser.Parser.__init__(self)
+                yaml.composer.Composer.__init__(self)
+                Constructor.__init__(self)
+                yaml.resolver.Resolver.__init__(self)
+
+    state['loader'] = Loader
 
 
 def load_prototxt(
@@ -37,7 +118,7 @@ def load_prototxt(
     """
 
     # HINT: in fact no load_kwargs required
-    load = lambda s: yaml.load(s, Loader=loader, **load_kwargs)
+    load = lambda s: yaml.load(s, Loader=state['loader'], **load_kwargs)
 
     if not re.search(r'^\s*\w+\s*[{:]', s): # if scalar
         return load(s)
@@ -88,7 +169,7 @@ def load_prototxt(
 
 def dump_prototxt(
         o:'Any',
-        unquote_rule:'Callable[str, bool]'=str.isupper,
+        unquote_rule:'Callable[[str], bool]'=str.isupper,
         quote:str='"', indent:int=2,
         **dump_kwargs)->str:
     r"""
@@ -241,6 +322,10 @@ if __name__ == '__main__':
     o = load_prototxt(t)
     print(o)
     print('-' * 8)
+
+    from easydict import EasyDict
+
+    set_default_dict_type(EasyDict)
     o = {'y': [1, 2], 'x': [{'a': 3.0, 'b': {'c': 4}}, {'a': 0, 'z': '1 2 3 4'}]}
     t = dump_prototxt(o)
     print(t)
