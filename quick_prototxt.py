@@ -11,13 +11,15 @@ from __future__ import absolute_import, division, unicode_literals
 import logging, re
 import yaml
 
+from io import StringIO
+
 
 DELIMITER             :str = '@'
 UNAME_ID_FORMAT       :str = '{:09d}'
 
 CYAML_WARNING_MESSAGE :str = (
-        'cYAML not enabled, using pyYAML implementation may impact performance')
-
+    'cYAML not enabled, using pyYAML implementation may impact performance'
+)
 
 logger :logging.Logger = logging.getLogger(name=__name__)
 
@@ -48,19 +50,19 @@ def set_default_dict_type(dict_cls:type):
 
         def construct_mapping(
                 self, node:Node,
-                *args, **kwargs)->'Mapping[Any, Any]':
+                *args, **kwds)->'Mapping[Any, Any]':
             if not isinstance(node, yaml.nodes.MappingNode):
                 raise ConstructorError(
-                        None, None,
-                        "expected a mapping node, but found %s" % (node.id, ),
-                        node.start_mark)
+                    None, None,
+                    "expected a mapping node, but found %s" % (node.id, ),
+                    node.start_mark)
             mapping = dict_cls()
             for key_node, value_node in node.value:
-                key = self.construct_object(key_node, *args, **kwargs)
+                key = self.construct_object(key_node, *args, **kwds)
                 if not isinstance(key, Hashable):
                     raise ConstructorError("while constructing a mapping", node.start_mark,
-                            "found unhashable key", key_node.start_mark)
-                value = self.construct_object(value_node, *args, **kwargs)
+                                           "found unhashable key", key_node.start_mark)
+                value = self.construct_object(value_node, *args, **kwds)
                 mapping[key] = value
             return mapping
 
@@ -71,9 +73,7 @@ def set_default_dict_type(dict_cls:type):
             value = self.construct_mapping(node)
             data.update(value)
 
-    Constructor.add_constructor(
-            u'tag:yaml.org,2002:map',
-            Constructor.construct_yaml_map)
+    Constructor.add_constructor(u'tag:yaml.org,2002:map', Constructor.construct_yaml_map)
 
     if hasattr(yaml, 'cyaml'):
         # @inherit_docs
@@ -111,33 +111,36 @@ def set_default_dict_type(dict_cls:type):
 
 def load_prototxt(
         s:str,
-        **load_kwargs)->'Any':
+        **load_kwds)->'Any':
     r"""
     direct deserialize from Protobuf text format
-    load_kwargs: kwargs for 'yaml.load', leave it empty
+    load_kwds: kwds for 'yaml.load', leave it empty
     """
 
-    # HINT: in fact no load_kwargs required
-    load = lambda s: yaml.load(s, Loader=state['loader'], **load_kwargs)
+    # HINT: in fact no load_kwds required
+    load = lambda s: yaml.load(s, Loader=state['loader'], **load_kwds)
 
-    if not re.search(r'^\s*\w+\s*[{:]', s): # if scalar
+    if not re.search(r'[a-zA-Z]\w*\s*[{:]', s): # if scalar
         return load(s)
 
     unames = dict()
 
     def replace_key(s):
-        t = []
+        t = StringIO()
         start = 0
         idx = 0
-        for m in re.finditer(r'(\n\s*)(\w+)\s*:', s):
+        for m in re.finditer(r'(\n\s*)([a-zA-Z]\w*)\s*:', s):
             prefix, ok = m.groups()
             nk = ok + DELIMITER + UNAME_ID_FORMAT.format(idx)
             unames[nk] = ok
-            t.extend([s[start:m.start()], prefix, nk, ':'])
+            t.write(s[start:m.start()])
+            t.write(prefix)
+            t.write(nk)
+            t.write(':')
             start = m.end()
             idx += 1
-        t.append(s[start:])
-        return ''.join(t)
+        t.write(s[start:])
+        return t.getvalue()
 
     def restore_key(no):
         oo = type(no)()
@@ -171,27 +174,28 @@ def dump_prototxt(
         o:'Any',
         unquote_rule:'Callable[[str], bool]'=str.isupper,
         quote:str='"', indent:int=2,
-        **dump_kwargs)->str:
+        **dump_kwds)->str:
     r"""
     direct serialize to Protobuf text format
     unquote_rule:
         function judges wether a string value should not be quoted for types like enum,
-        by default full-uppercased
+        by default full-uppercased (an usual alternative is str.istitle)
     quote: prefered quote convension, ' or "
     indent: indent size
-    dump_kwargs: kwargs for 'yaml.dump'
+    dump_kwds: kwds for 'yaml.dump'
     """
 
     list_clss = (list, tuple, set)
 
-    assert not isinstance(o, list_clss), "'o' cannot be unnamed list"
+    assert not isinstance(o, list_clss), f"'o' {o!r}cannot be unnamed list"
 
-    dump_kwargs_ = dict(
-            indent=indent, width=(indent * 2 + 1),
-            default_flow_style=True, allow_unicode=True,
-            )
-    dump_kwargs_.update(dump_kwargs)
-    dump = lambda o: yaml.dump(o, Dumper=dumper, **dump_kwargs_)
+    # sorting is a required default behavior
+    dump_kwds_ = dict(
+        indent=indent, width=(indent * 2 + 1),
+        default_flow_style=True, allow_unicode=True, # sort_keys=True,
+    )
+    dump_kwds_.update(dump_kwds)
+    dump = lambda o: yaml.dump(o, Dumper=dumper, **dump_kwds_)
 
     def remove_document_end(s):
         t = '\n...'
@@ -201,7 +205,10 @@ def dump_prototxt(
 
     if not isinstance(o, dict): # extra scalar support
         if isinstance(o, str):
-            s = quote + o + quote
+            if unquote_rule(o):
+                s = o
+            else:
+                s = quote + o + quote
         else:
             s = dump(o)
             s = s.strip()
@@ -209,19 +216,34 @@ def dump_prototxt(
         return s + '\n'
 
     str_tag = '!str '
-    str_re = re.compile(r'([\'"])' + str_tag + r'(.*)([\'"])\s*\n')
+
+    # impl from protobuf
+    def is_numeric(s):
+        if re.match(r'-?inf(?:inity)?f?', s, re.IGNORECASE):
+            return True
+        if re.match(r'nanf?', s, re.IGNORECASE):
+            return True
+        try:
+            float(s.rstrip('f')) # throw ValueError
+        except ValueError:
+            return False
+        else:
+            return True
 
     def replace_key_value(oo):
         no = type(oo)()
         for ok, ov in oo.items():
+            assert DELIMITER not in ok, f'invalid field name {ok!r} in Protobuf'
+
             if isinstance(ov, dict):
                 no[ok] = replace_key_value(ov)
             elif isinstance(ov, str):
-                no[ok] = str_tag + ov
+                no[ok] = ov if is_numeric(ov) else str_tag + ov # skip numeric literals
             elif isinstance(ov, list_clss):
                 prefix = str(ok) + DELIMITER
                 for idx, oi in enumerate(ov):
-                    assert not isinstance(oi, list_clss), 'list item cannot be unnamed list'
+                    assert not isinstance(oi, list_clss), (
+                        f'list item {oi!r} cannot be unnamed list')
 
                     nk = prefix + UNAME_ID_FORMAT.format(idx) # make key ordered
                     ni = replace_key_value(oi) if isinstance(oi, dict) else oi
@@ -231,72 +253,88 @@ def dump_prototxt(
         return no
 
     def restore_key(s):
-        t = []
+        t = StringIO()
         start = 0
-        for m in re.finditer(r'(\n\s*)(\w+)' + DELIMITER + r'\d+\s*:', s):
+        for m in re.finditer(r'(\n\s*)([a-zA-Z]\w*)' + DELIMITER + r'\d+\s*:', s):
             prefix, ok = m.groups()
-            t.extend([s[start:m.start()], prefix, ok, ':'])
+            t.write(s[start:m.start()])
+            t.write(prefix)
+            t.write(ok)
+            t.write(':')
             start = m.end()
-        t.append(s[start:])
-        return ''.join(t)
+        t.write(s[start:])
+        return t.getvalue()
 
     def fix_mapping_end_break(s):
-        t = []
+        t = StringIO()
         start = 0
         current_space_size = 0
         for m in re.finditer(r'\n(\s*)(.+?)({*)(}*)(?=\n)', s):
             spaces, content, lbraces, rbraces = m.groups()
-
-            t.append(s[start:m.start()])
+            t.write(s[start:m.start()])
 
             if len(spaces) > current_space_size:
                 assert len(spaces) == current_space_size + indent
 
                 spaces = spaces[:current_space_size]
-                t.extend([' ', content])
+                t.write(' ')
             else:
                 assert len(spaces) == current_space_size
 
-                t.extend(['\n', spaces, content])
+                t.write('\n')
+                t.write(spaces)
 
-            t.append(lbraces)
             current_space_size += indent * len(lbraces)
             assert current_space_size >= len(rbraces) * indent
 
+            spaces = ' ' * current_space_size
+            current_space_size -= indent * len(rbraces)
+            t.write(content)
+            t.write(lbraces)
+
             for brace in rbraces:
                 spaces = spaces[:-indent]
-                t.extend(['\n', spaces, brace])
-            current_space_size -= indent * len(rbraces)
+                t.write('\n')
+                t.write(spaces)
+                t.write(brace)
 
             start = m.end()
-        t.append(s[start:])
-        return ''.join(t)
+
+        t.write(s[start:])
+        return t.getvalue()
 
     def fix_value_quote(s):
-        t = []
+        t = StringIO()
         start = 0
-        for m in re.finditer(r'(?<=\n)(\s*)(\w+)(:\s*)(.+?)(\s*\n)', s):
+        str_re = re.compile(r'([\'"])' + str_tag + r'(.*?)([\'"])\s*\n') #
+        for m in re.finditer(r'(?<=\n)(\s*)([a-zA-Z]\w*)(:\s*)(.+?)(\s*\n)', s):
             s0, key, s1, value, s2 = m.groups()
+            t.write(s[start:m.start()])
+            t.write(s0)
+            t.write(key)
+            t.write(s1)
 
-            values = [value]
+            unquoted = True
             str_match = str_re.match(value + s2)
             if str_match:
                 lquote, value, rquote = str_match.groups()
                 if lquote == rquote:
-                    if unquote_rule(value):
-                        values = [value]
-                    else:
+                    if not unquote_rule(value):
+                        unquoted = False
                         if lquote != quote and quote not in value: # HINT: not forced
                             lquote = quote
-                        values = [lquote, value, lquote]
+                        t.write(lquote)
+                        t.write(value)
+                        t.write(lquote)
 
-            t.extend([s[start:m.start()], s0, key, s1])
-            t.extend(values)
-            t.append(s2)
+            if unquoted:
+                t.write(value)
 
+            t.write(s2)
             start = m.end()
-        t.append(s[start:])
-        return ''.join(t)
+
+        t.write(s[start:])
+        return t.getvalue()
 
     o = replace_key_value(o)
     # HINT: ~ canonical=True
